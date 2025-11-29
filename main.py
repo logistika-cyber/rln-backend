@@ -2,6 +2,7 @@ from fastapi import FastAPI, Form
 from fastapi.middleware.cors import CORSMiddleware
 import uuid
 from datetime import datetime
+import database
 
 app = FastAPI()
 
