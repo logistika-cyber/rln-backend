@@ -231,3 +231,22 @@ def list_files(order_id: int):
         }
         for r in rows
     ]
+from fastapi import UploadFile, File, Form
+from storage_yandex import upload_file_to_yandex
+
+@app.post("/upload")
+async def upload_file(
+    order_id: int = Form(...),
+    doc_type: str = Form("generic"),
+    file: UploadFile = File(...)
+):
+    data = await file.read()  # читаем байты
+    url = upload_file_to_yandex(data, file.filename, order_id, doc_type)
+
+    return {
+        "status": "uploaded",
+        "order_id": order_id,
+        "doc_type": doc_type,
+        "name": file.filename,
+        "url": url
+    }
