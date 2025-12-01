@@ -4,7 +4,9 @@ import uuid
 from datetime import datetime
 import psycopg2
 import os
-from typing import List
+from typing import List, Optional
+
+from storage_yandex import upload_bytes_to_yandex  # используем наш модуль для Яндекс S3
 
 app = FastAPI()
 
@@ -151,13 +153,38 @@ def update_status(order_id: int, new_status: str = Form(...)):
     return {"status": "ok", "order_id": order_id, "new_status": new_status}
 
 
-# 📌 Загрузить файл (акт, фото, видео) к заявке
+# --- Ограничения для файлов (акт / видео для RLN-M3) ---
+
+ALLOWED_ACT_CONTENT_TYPES = {
+    "application/pdf",
+    "image/jpeg",
+    "image/jpg",
+    "image/png",
+}
+
+ALLOWED_VIDEO_CONTENT_TYPES = {
+    "video/mp4",
+    "video/quicktime",  # .mov
+}
+
+MAX_ACT_SIZE_MB = 10
+MAX_VIDEO_SIZE_MB = 100
+
+
+# 📌 Загрузить файл (акт, фото, видео) к заявке — уже через Яндекс Object Storage
 @app.post("/order/{order_id}/upload_file")
-def upload_file(
+async def upload_order_file(
     order_id: int,
     file: UploadFile = File(...),
-    file_type: str = Form("other"),  # например: 'акт', 'фото', 'видео'
+    file_type: str = Form("other"),  # 'act', 'video', 'other'
 ):
+    """
+    Загрузка файла к заявке:
+    - для RLN-M3: file_type = 'act' или 'video'
+    - файл уходит в Яндекс Object Storage
+    - в таблице files сохраняем ссылку (file_url)
+    """
+
     conn = get_conn()
     cur = conn.cursor()
 
@@ -168,36 +195,77 @@ def upload_file(
         conn.close()
         raise HTTPException(status_code=404, detail="Заказ не найден")
 
-    # сохраняем файл в папку uploads (на Render хранение временное, но для MVP хватает)
-    uploads_dir = "uploads"
-    os.makedirs(uploads_dir, exist_ok=True)
+    content_type = file.content_type or "application/octet-stream"
 
-    unique_name = f"{order_id}_{uuid.uuid4().hex}_{file.filename}"
-    file_path = os.path.join(uploads_dir, unique_name)
+    # Проверка типов и размеров
+    if file_type == "act":
+        if content_type not in ALLOWED_ACT_CONTENT_TYPES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Недопустимый тип файла для акта: {content_type}",
+            )
+        max_size_bytes = MAX_ACT_SIZE_MB * 1024 * 1024
 
-    with open(file_path, "wb") as f:
-        f.write(file.file.read())
+    elif file_type == "video":
+        if content_type not in ALLOWED_VIDEO_CONTENT_TYPES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Недопустимый тип видео: {content_type}",
+            )
+        max_size_bytes = MAX_VIDEO_SIZE_MB * 1024 * 1024
 
-    # записываем в таблицу files
-    cur.execute(
-        """
-        INSERT INTO files (order_id, file_url, file_type)
-        VALUES (%s, %s, %s)
-        RETURNING id, uploaded_at;
-        """,
-        (order_id, file_path, file_type),
-    )
-    row = cur.fetchone()
-    conn.commit()
-    cur.close()
-    conn.close()
+    else:
+        # для прочих файлов можно задать общий лимит
+        max_size_bytes = 20 * 1024 * 1024  # 20 МБ
+
+    data = await file.read()
+
+    if len(data) > max_size_bytes:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Файл слишком большой. Лимит: {max_size_bytes // (1024 * 1024)} МБ",
+        )
+
+    # Формируем путь в бакете: orders/{order_id}/{file_type}/{timestamp}_{original_name}
+    safe_filename = file.filename.replace(" ", "_")
+    timestamp = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+    object_name = f"orders/{order_id}/{file_type}/{timestamp}_{safe_filename}"
+
+    # Загружаем байты в Яндекс S3 и получаем URL
+    try:
+        file_url = upload_bytes_to_yandex(
+            data=data,
+            content_type=content_type,
+            object_name=object_name,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Ошибка загрузки в Yandex S3: {e}")
+
+    # записываем в таблицу files ссылку на файл
+    try:
+        cur.execute(
+            """
+            INSERT INTO files (order_id, file_url, file_type)
+            VALUES (%s, %s, %s)
+            RETURNING id, uploaded_at;
+            """,
+            (order_id, file_url, file_type),
+        )
+        row = cur.fetchone()
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=f"Ошибка сохранения файла в базе: {e}")
+    finally:
+        cur.close()
+        conn.close()
 
     return {
         "status": "uploaded",
         "file_id": row[0],
         "order_id": order_id,
         "file_type": file_type,
-        "path": file_path,
+        "url": file_url,
         "uploaded_at": row[1],
     }
 
@@ -225,28 +293,9 @@ def list_files(order_id: int):
     return [
         {
             "id": r[0],
-            "file_url": r[1],
+            "file_url": r[1],   # здесь уже будет полный URL из Яндекса
             "file_type": r[2],
             "uploaded_at": r[3],
         }
         for r in rows
     ]
-from fastapi import UploadFile, File, Form
-from storage_yandex import upload_file_to_yandex
-
-@app.post("/upload")
-async def upload_file(
-    order_id: int = Form(...),
-    doc_type: str = Form("generic"),
-    file: UploadFile = File(...)
-):
-    data = await file.read()  # читаем байты
-    url = upload_file_to_yandex(data, file.filename, order_id, doc_type)
-
-    return {
-        "status": "uploaded",
-        "order_id": order_id,
-        "doc_type": doc_type,
-        "name": file.filename,
-        "url": url
-    }
